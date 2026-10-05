@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+"""Install Aghast's shared instructions and skills into local agent harnesses."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import stat
+import sys
+from pathlib import Path
+from typing import Any
+
+
+REPO = Path(__file__).resolve().parent
+AGENTS_SOURCE = REPO / "AGENTS.md"
+TRACKED_SKILLS = REPO / "skills"
+HOME = Path.home().resolve()
+MARKER = ".aghast-managed"
+STATE_VERSION = 1
+SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def expand_path(value: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(value))).absolute()
+
+
+def codex_home() -> Path:
+    return expand_path(os.environ.get("CODEX_HOME", str(HOME / ".codex")))
+
+
+def aghast_home() -> Path:
+    configured = os.environ.get("AGHAST_HOME")
+    if configured:
+        result = expand_path(configured)
+    else:
+        data_home = expand_path(os.environ.get("XDG_DATA_HOME", str(HOME / ".local" / "share")))
+        result = data_home / "aghast"
+    resolved = result.resolve(strict=False)
+    if is_within(resolved, REPO.resolve()):
+        raise RuntimeError("AGHAST_HOME must be outside the Aghast checkout.")
+    return resolved
+
+
+def is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(parent.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def paths_overlap(left: Path, right: Path) -> bool:
+    return is_within(left, right) or is_within(right, left)
+
+
+def validate_data_home(data_home: Path, protected: tuple[Path, ...]) -> None:
+    if data_home == Path("/") or data_home == HOME or data_home in HOME.parents:
+        raise RuntimeError(f"Refusing unsafe AGHAST_HOME path: {data_home}")
+    for path in protected:
+        if paths_overlap(data_home, path):
+            raise RuntimeError(f"AGHAST_HOME overlaps a managed path: {path}")
+
+
+def lexists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def timestamp() -> str:
+    return dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+
+
+def unique_backup(path: Path, suffix: str, stamp: str) -> Path:
+    candidate = path.with_name(f"{path.name}.aghast-{suffix}-{stamp}")
+    index = 1
+    while lexists(candidate):
+        candidate = path.with_name(f"{path.name}.aghast-{suffix}-{stamp}-{index}")
+        index += 1
+    return candidate
+
+
+def load_state() -> dict[str, Any]:
+    path = aghast_home() / "state.json"
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cannot read Aghast state at {path}: {exc}") from exc
+    if not isinstance(value, dict) or value.get("version") != STATE_VERSION:
+        raise RuntimeError(f"Unsupported Aghast state format at {path}.")
+    return value
+
+
+def save_state(value: dict[str, Any], dry_run: bool) -> None:
+    if dry_run:
+        return
+    directory = aghast_home()
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "state.json"
+    temporary = directory / "state.json.tmp"
+    temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def root_is_managed(path: Path) -> bool:
+    marker = path / MARKER
+    if not marker.is_file():
+        return False
+    try:
+        return marker.read_text(encoding="utf-8").startswith("aghast-managed-v1\n")
+    except OSError:
+        return False
+
+
+def snapshot_directory(path: Path, stamp: str, dry_run: bool) -> Path | None:
+    if not path.is_dir():
+        return None
+    backup = unique_backup(path, "backup", stamp)
+    print(f"Copy directory {path} -> {backup}")
+    if not dry_run:
+        shutil.copytree(
+            path,
+            backup,
+            symlinks=True,
+            copy_function=shutil.copy2,
+            ignore=ignore_unix_sockets,
+        )
+    return backup
+
+
+def ignore_unix_sockets(directory: str, names: list[str]) -> set[str]:
+    ignored: set[str] = set()
+    for name in names:
+        entry = Path(directory) / name
+        try:
+            mode = entry.lstat().st_mode
+        except OSError:
+            continue
+        if stat.S_ISSOCK(mode):
+            print(f"Skip Unix socket in snapshot: {entry}")
+            ignored.add(name)
+    return ignored
+
+
+def snapshot_root(path: Path, stamp: str, dry_run: bool) -> Path | None:
+    if not lexists(path) or root_is_managed(path):
+        return None
+    if not path.is_dir():
+        raise RuntimeError(f"Harness home exists and is not a directory: {path}")
+    return snapshot_directory(path, stamp, dry_run)
+
+
+def ensure_managed_root(path: Path, dry_run: bool) -> None:
+    managed_before = root_is_managed(path)
+    if lexists(path) and not path.is_dir():
+        raise RuntimeError(f"Harness home exists and is not a directory: {path}")
+    if not lexists(path):
+        print(f"Create directory {path}")
+        if not dry_run:
+            path.mkdir(parents=True, exist_ok=True)
+    marker = path / MARKER
+    if not dry_run:
+        marker.write_text(
+            f"aghast-managed-v1\nrepository={REPO}\n", encoding="utf-8"
+        )
+
+
+def previous_managed_link(path: Path, previous_repo: Path | None, local_skills: Path) -> bool:
+    if not path.is_symlink():
+        return False
+    target = path.resolve(strict=False)
+    return (previous_repo is not None and is_within(target, previous_repo)) or is_within(
+        target, local_skills
+    )
+
+
+def backup_conflict(
+    path: Path,
+    stamp: str,
+    dry_run: bool,
+    backup_parent: Path | None = None,
+) -> Path:
+    backup_root = (backup_parent or path.parent / f".{path.name}.aghast-backups") / stamp
+    backup = backup_root / path.name
+    index = 1
+    while lexists(backup):
+        backup = backup_root / f"{path.name}-{index}"
+        index += 1
+    print(f"Preserve existing {path} -> {backup}")
+    if not dry_run:
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(path, backup)
+    return backup
+
+
+def link_path(
+    source: Path,
+    destination: Path,
+    stamp: str,
+    dry_run: bool,
+    previous_repo: Path | None,
+    local_skills: Path,
+    snapshots: dict[Path, Path] | None = None,
+    skill_root: Path | None = None,
+) -> None:
+    source = source.resolve(strict=False)
+    snapshots = snapshots or {}
+    if destination.is_symlink() and destination.resolve(strict=False) == source:
+        print(f"Already linked {destination} -> {source}")
+        return
+    if lexists(destination):
+        if previous_managed_link(destination, previous_repo, local_skills):
+            print(f"Update Aghast link {destination} -> {source}")
+            if not dry_run:
+                destination.unlink()
+        elif any(destination == root or root in destination.parents for root in snapshots):
+            snapshot_root = next(
+                root for root in snapshots if destination == root or root in destination.parents
+            )
+            if destination.is_symlink() or destination.is_file():
+                saved_copy = snapshots[snapshot_root] / destination.relative_to(snapshot_root)
+                print(f"Replace {destination}; copy preserved at {saved_copy}")
+                if not dry_run:
+                    destination.unlink()
+            else:
+                backup_parent = None
+                if skill_root is not None:
+                    backup_parent = skill_root.parent / f".{skill_root.name}.aghast-backups"
+                backup_conflict(destination, stamp, dry_run, backup_parent)
+        else:
+            backup_parent = None
+            if skill_root is not None:
+                backup_parent = skill_root.parent / f".{skill_root.name}.aghast-backups"
+            backup_conflict(destination, stamp, dry_run, backup_parent)
+    print(f"Link {destination} -> {source}")
+    if not dry_run:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.symlink_to(source, target_is_directory=source.is_dir())
+
+
+def skill_sources(local_skills: Path) -> dict[str, Path]:
+    result: dict[str, Path] = {}
+    for root in (TRACKED_SKILLS, local_skills):
+        if not root.is_dir():
+            continue
+        for skill in sorted(root.iterdir()):
+            if skill.is_symlink() or not skill.is_dir():
+                continue
+            manifest = skill / "SKILL.md"
+            if not manifest.is_file():
+                continue
+            if manifest.is_symlink():
+                raise RuntimeError(f"A skill's SKILL.md must be a regular file: {manifest}")
+            name = skill.name
+            if not SKILL_NAME_RE.fullmatch(name):
+                raise RuntimeError(f"Invalid skill directory name {name!r}; use lowercase kebab-case.")
+            if name in result:
+                raise RuntimeError(f"Duplicate skill name {name!r} in {result[name]} and {skill}.")
+            result[name] = skill.resolve()
+    return result
+
+
+def ensure_skill_root(path: Path, stamp: str, dry_run: bool) -> None:
+    if path.is_symlink() and path.is_dir():
+        return
+    replace_root = path.is_symlink() or (lexists(path) and not path.is_dir())
+    if replace_root:
+        backup_conflict(path, stamp, dry_run)
+    if replace_root or not path.is_dir():
+        print(f"Create directory {path}")
+        if not dry_run:
+            path.mkdir(parents=True, exist_ok=True)
+
+
+def install(dry_run: bool = False) -> None:
+    if not AGENTS_SOURCE.is_file():
+        raise RuntimeError(f"Missing shared instructions: {AGENTS_SOURCE}")
+    state = load_state()
+    previous_repo_value = state.get("repository")
+    previous_repo = Path(previous_repo_value) if previous_repo_value else None
+    local_skills = aghast_home() / "skills"
+    skills = skill_sources(local_skills)
+    stamp = timestamp()
+    codex = codex_home()
+    claude = HOME / ".claude"
+    opencode = HOME / ".config" / "opencode"
+    agents_home = HOME / ".agents"
+
+    if codex == Path("/") or codex == HOME or codex in HOME.parents:
+        raise RuntimeError(f"Refusing unsafe CODEX_HOME path: {codex}")
+    data_home = aghast_home()
+    validate_data_home(data_home, (REPO, codex, claude, opencode, agents_home))
+    for path in (REPO, claude, opencode, agents_home, data_home):
+        if paths_overlap(codex, path):
+            raise RuntimeError(f"CODEX_HOME overlaps a protected Aghast or harness path: {path}")
+    roots = {"claude": claude, "codex": codex}
+    snapshots: dict[Path, Path] = {}
+    for root in roots.values():
+        backup = snapshot_root(root, stamp, dry_run)
+        if backup is not None:
+            snapshots[root] = backup
+
+    skill_roots = (agents_home / "skills", claude / "skills")
+    skill_snapshots = dict(state.get("skill_snapshots", {}))
+    for skill_root in skill_roots:
+        key = str(skill_root)
+        if key in skill_snapshots:
+            continue
+        containing_root = next(
+            (root for root in snapshots if root in skill_root.parents), None
+        )
+        if containing_root is not None and not skill_root.is_symlink():
+            skill_snapshots[key] = str(
+                snapshots[containing_root] / skill_root.relative_to(containing_root)
+            )
+            continue
+        backup = snapshot_directory(skill_root, stamp, dry_run)
+        skill_snapshots[key] = str(backup) if backup is not None else None
+
+    for root in roots.values():
+        ensure_managed_root(root, dry_run)
+
+    if lexists(opencode) and not opencode.is_dir():
+        raise RuntimeError(f"OpenCode config path exists and is not a directory: {opencode}")
+    if not opencode.is_dir():
+        print(f"Create directory {opencode}")
+        if not dry_run:
+            opencode.mkdir(parents=True, exist_ok=True)
+
+    local_skill_root = agents_home / "skills"
+    claude_skill_root = claude / "skills"
+    ensure_skill_root(local_skill_root, stamp, dry_run)
+    ensure_skill_root(claude_skill_root, stamp, dry_run)
+
+    for source, destination in (
+        (AGENTS_SOURCE, codex / "AGENTS.md"),
+        (AGENTS_SOURCE, claude / "CLAUDE.md"),
+        (AGENTS_SOURCE, opencode / "AGENTS.md"),
+    ):
+        link_path(source, destination, stamp, dry_run, previous_repo, local_skills, snapshots)
+
+    previous_names = set(state.get("managed_skills", []))
+    current_names = set(skills)
+    for stale_name in sorted(previous_names - current_names):
+        for root in skill_roots:
+            old_link = root / stale_name
+            if previous_managed_link(old_link, previous_repo, local_skills):
+                print(f"Remove stale Aghast skill link {old_link}")
+                if not dry_run:
+                    old_link.unlink()
+
+    for name, source in sorted(skills.items()):
+        for root in skill_roots:
+            link_path(
+                source,
+                root / name,
+                stamp,
+                dry_run,
+                previous_repo,
+                local_skills,
+                skill_root=root,
+            )
+
+    root_snapshots = dict(state.get("root_snapshots", {}))
+    for name, root in roots.items():
+        if root in snapshots:
+            root_snapshots[name] = str(snapshots[root])
+    new_state = {
+        "version": STATE_VERSION,
+        "repository": str(REPO.resolve()),
+        "managed_skills": sorted(skills),
+        "skill_roots": [str(path) for path in skill_roots],
+        "root_snapshots": root_snapshots,
+        "skill_snapshots": skill_snapshots,
+    }
+    save_state(new_state, dry_run)
+    if dry_run:
+        print("Dry run complete; no files were changed.")
+    else:
+        print(f"Aghast installed from {REPO}")
+
+
+def skill_add(source_arg: str, name_arg: str | None) -> None:
+    state = load_state()
+    if not state or not root_is_managed(HOME / ".claude") or not root_is_managed(codex_home()):
+        raise RuntimeError("Run './aghast install' before adding a local skill.")
+    source = expand_path(source_arg).resolve(strict=True)
+    if not source.is_dir() or not (source / "SKILL.md").is_file():
+        raise RuntimeError(f"Expected a skill directory containing SKILL.md: {source}")
+    if (source / "SKILL.md").is_symlink():
+        raise RuntimeError(f"SKILL.md must be a regular file: {source / 'SKILL.md'}")
+    name = name_arg or source.name
+    if not SKILL_NAME_RE.fullmatch(name):
+        raise RuntimeError(f"Invalid skill name {name!r}; use lowercase kebab-case.")
+    tracked = TRACKED_SKILLS / name
+    if tracked.is_dir() and (tracked / "SKILL.md").is_file():
+        raise RuntimeError(f"A checked-in skill already uses the name {name!r}.")
+    local_skills = aghast_home() / "skills"
+    validate_data_home(
+        aghast_home(),
+        (REPO, codex_home(), HOME / ".claude", HOME / ".config" / "opencode", HOME / ".agents"),
+    )
+    destination = local_skills / name
+    if lexists(destination):
+        raise RuntimeError(f"A local skill already uses the name {name!r}: {destination}")
+    local_skills.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, destination, ignore=shutil.ignore_patterns(".venv"))
+    print(f"Copied {source} -> {destination}")
+    install()
+
+
+def status() -> int:
+    state = load_state()
+    if not state:
+        print("Aghast is not installed. Run './aghast install --dry-run' to preview setup.")
+        return 1
+    current_repo = REPO.resolve()
+    if state.get("repository") != str(current_repo):
+        print(f"Repository changed: installed links point to {state.get('repository')}.")
+        print("Run './aghast install' to update links.")
+    local_skills = aghast_home() / "skills"
+    expected = (
+        ("Codex instructions", codex_home() / "AGENTS.md", AGENTS_SOURCE),
+        ("Claude Code instructions", HOME / ".claude" / "CLAUDE.md", AGENTS_SOURCE),
+        ("OpenCode instructions", HOME / ".config" / "opencode" / "AGENTS.md", AGENTS_SOURCE),
+    )
+    broken = False
+    for label, destination, source in expected:
+        ok = destination.is_symlink() and destination.resolve(strict=False) == source.resolve()
+        print(f"{'OK' if ok else 'MISSING/CHANGED'} {label}: {destination}")
+        broken = broken or not ok
+
+    skills = skill_sources(local_skills)
+    for root in (HOME / ".agents" / "skills", HOME / ".claude" / "skills"):
+        for name, source in sorted(skills.items()):
+            destination = root / name
+            ok = destination.is_symlink() and destination.resolve(strict=False) == source.resolve()
+            print(f"{'OK' if ok else 'MISSING/CHANGED'} skill {name}: {destination}")
+            broken = broken or not ok
+    print(f"Tracked skills: {sum(1 for path in TRACKED_SKILLS.iterdir() if path.is_dir() and (path / 'SKILL.md').is_file()) if TRACKED_SKILLS.is_dir() else 0}")
+    print(f"Local skills: {len([name for name, path in skills.items() if is_within(path, local_skills)])}")
+    return 1 if broken else 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="aghast", description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    install_parser = subparsers.add_parser(
+        "install", help="copy existing harness homes and create Aghast links"
+    )
+    install_parser.add_argument("--dry-run", action="store_true", help="show changes without applying them")
+
+    subparsers.add_parser("status", help="show whether expected Aghast links are active")
+
+    skill_parser = subparsers.add_parser("skill", help="manage private, untracked skills")
+    skill_subparsers = skill_parser.add_subparsers(dest="skill_command", required=True)
+    add_parser = skill_subparsers.add_parser(
+        "add", help="copy a skill into Aghast's private store, excluding .venv"
+    )
+    add_parser.add_argument("path", help="path to a directory containing SKILL.md")
+    add_parser.add_argument("--name", help="override the skill directory name")
+
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        if args.command == "install":
+            install(dry_run=args.dry_run)
+            return 0
+        if args.command == "status":
+            return status()
+        if args.command == "skill" and args.skill_command == "add":
+            skill_add(args.path, args.name)
+            return 0
+        raise RuntimeError("Unknown command.")
+    except (OSError, RuntimeError) as exc:
+        print(f"aghast: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
